@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BULLET STORM - Cyberpunk Bullet Hell</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+  }
+  #gameContainer {
+    position: relative;
+    display: inline-block;
+  }
+  canvas {
+    display: block;
+    border: 1px solid #0ff;
+    box-shadow: 0 0 30px #0ff, 0 0 60px #0ff4, 0 0 100px #0ff2;
+  }
+</style>
+</head>
+<body>
+<div id="gameContainer">
+  <canvas id="gameCanvas" width="900" height="650"></canvas>
+</div>
+<script>
+// ============================================================
+// AUDIO ENGINE
+// ============================================================
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+let audioCtx = null;
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new AudioCtx();
+}
+
+// BGM - minimal techno loop
+let bgmNodes = [];
+let bgmPlaying = false;
+function startBGM() {
+  if (!audioCtx || bgmPlaying) return;
+  bgmPlaying = true;
+  const tempo = 0.4; // seconds per beat
+  const bpm = 150;
+  const beatDur = 60 / bpm;
+
+  function scheduleBeat(time, freq, dur, vol) {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 800;
+    osc.connect(filter);
+    filter.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.type = 'square';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0, time);
+    gain.gain.linearRampToValueAtTime(vol, time + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
+    osc.start(time);
+    osc.stop(time + dur + 0.05);
+  }
+
+  function scheduleLoop() {
+    if (!bgmPlaying || !audioCtx) return;
+    const now = audioCtx.currentTime;
+    const loopLen = beatDur * 16;
+    // Bass kick pattern
+    const kickFreqs = [0, 4, 8, 12];
+    kickFreqs.forEach(b => scheduleBeat(now + b * beatDur, 60, beatDur * 0.3, 0.18));
+    // Snare-like
+    [2, 6, 10, 14].forEach(b => scheduleBeat(now + b * beatDur, 180, beatDur * 0.15, 0.08));
+    // Arpeggio melody
+    const melody = [261, 329, 392, 523, 392, 329, 261, 196, 261, 329, 440, 523, 440, 329, 196, 261];
+    melody.forEach((f, i) => scheduleBeat(now + i * beatDur, f, beatDur * 0.6, 0.04));
+    // Hi-hat
+    for (let i = 0; i < 16; i++) scheduleBeat(now + i * beatDur * 0.5, 8000, 0.05, 0.015);
+
+    setTimeout(scheduleLoop, loopLen * 1000 - 200);
+  }
+  scheduleLoop();
+}
+
+function stopBGM() { bgmPlaying = false; }
+
+function playHitSound() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  for (let i = 0; i < 3; i++) {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(400 - i * 80, now + i * 0.04);
+    osc.frequency.exponentialRampToValueAtTime(100, now + i * 0.04 + 0.1);
+    gain.gain.setValueAtTime(0.15, now + i * 0.04);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.04 + 0.12);
+    osc.start(now + i * 0.04); osc.stop(now + i * 0.04 + 0.15);
+  }
+}
+
+function playSlowSound() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  const delay = audioCtx.createDelay();
+  delay.delayTime.value = 0.08;
+  osc.connect(delay); delay.connect(gain); gain.connect(audioCtx.destination);
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(300, now);
+  osc.frequency.exponentialRampToValueAtTime(80, now + 0.5);
+  gain.gain.setValueAtTime(0.2, now);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.8);
+  osc.start(now); osc.stop(now + 1);
+}
+
+function playGameOverSound() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  const freqs = [440, 330, 220, 110];
+  freqs.forEach((f, i) => {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(f, now + i * 0.2);
+    gain.gain.setValueAtTime(0.2, now + i * 0.2);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + i * 0.2 + 0.4);
+    osc.start(now + i * 0.2); osc.stop(now + i * 0.2 + 0.5);
+  });
+}
+
+// ============================================================
+// CANVAS & GAME STATE
+// ============================================================
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width;
+const H = canvas.height;
+
+const STATES = { TITLE: 0, PLAYING: 1, GAMEOVER: 2 };
+let state = STATES.TITLE;
+
+// Player
+const player = {
+  x: W / 2, y: H / 2,
+  speed: 11,          // normal speed (px/frame) — instant, no inertia
+  preciseSpeed: 3.5,  // precise mode speed (px/frame) when Shift held
+  hp: 3, maxHp: 3,
+  coreRadius: 4,
+  invincible: 0,
+};
+
+// Chrono Drive
+const chrono = {
+  gauge: 0, maxGauge: 100,
+  chargeRate: 8, // per second
+  active: false,
+  timer: 0, duration: 3,
+  slowFactor: 0.33,
+};
+
+// Bullets, enemies, items, particles
+let bullets = [];
+let items = [];
+let particles = [];
+let shockwaves = [];
+
+// Score / time
+let survivalTime = 0;
+let spawnTimer = 0;
+let itemTimer = 0;
+let itemInterval = 8;
+
+// Input
+const keys = {};
+let mouseX = W / 2, mouseY = H / 2;
+let useMouseControl = false;
+
+// Glitch effect
+let glitchTimer = 0;
+const GLITCH_DURATION = 0.1;
+
+// Game over explosion state
+let gameOverTimer = 0;
+let gameOverExplosionDone = false;
+
+// Grid scroll offset
+let gridOffset = 0;
+
+// Rankings (localStorage)
+function loadRankings() {
+  try {
+    const data = localStorage.getItem('bulletStormRankings');
+    return data ? JSON.parse(data) : [];
+  } catch(e) { return []; }
+}
+function saveRanking(score) {
+  let ranks = loadRankings();
+  ranks.push(Math.floor(score));
+  ranks.sort((a, b) => b - a);
+  ranks = ranks.slice(0, 5);
+  try { localStorage.setItem('chronoDriveRankings', JSON.stringify(ranks)); } catch(e) {}
+  return ranks;
+}
+
+let currentRankings = [];
+
+// ============================================================
+// BULLET PATTERNS
+// ============================================================
+function spawnBullet(x, y, vx, vy, color, radius) {
+  bullets.push({ x, y, vx, vy, color: color || '#ff00ff', radius: radius || 4, trail: [] });
+}
+
+function patternSpiral(cx, cy, angle, count, speed, color) {
+  // Spiral with guaranteed gaps - only fire partial arc
+  const arcFraction = 0.6; // only 60% of circle covered = gap for player
+  for (let i = 0; i < count; i++) {
+    const a = angle + (i / count) * Math.PI * 2 * arcFraction;
+    spawnBullet(cx, cy, Math.cos(a) * speed, Math.sin(a) * speed, color, 4);
+  }
+}
+
+function patternAimed(fromX, fromY, targetX, targetY, spread, count, speed, color) {
+  const baseAngle = Math.atan2(targetY - fromY, targetX - fromX);
+  const totalSpread = spread * (count - 1);
+  for (let i = 0; i < count; i++) {
+    const a = baseAngle - totalSpread / 2 + i * spread;
+    spawnBullet(fromX, fromY, Math.cos(a) * speed, Math.sin(a) * speed, color, 4);
+  }
+}
+
+function patternScatter(cx, cy, count, speed, color) {
+  // Random scatter but with forced gap zone around player
+  const playerAngle = Math.atan2(player.y - cy, player.x - cx);
+  const gapHalfAngle = Math.PI * 0.35; // ~63 degree gap toward player direction
+  for (let i = 0; i < count; i++) {
+    let a = Math.random() * Math.PI * 2;
+    // Avoid gap zone near player
+    let diff = a - playerAngle;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    if (Math.abs(diff) < gapHalfAngle) {
+      a = playerAngle + (Math.random() < 0.5 ? 1 : -1) * (gapHalfAngle + Math.random() * 0.5);
+    }
+    spawnBullet(cx, cy, Math.cos(a) * speed, Math.sin(a) * speed, color, 4);
+  }
+}
+
+function patternRing(cx, cy, count, speed, color, offsetAngle) {
+  // Ring with a wedge gap - always leave a clear escape route
+  const gapAngle = Math.PI * 0.5; // 90 degree gap
+  const gapDir = Math.atan2(player.y - cy, player.x - cx) + Math.PI; // gap TOWARD player
+  for (let i = 0; i < count; i++) {
+    const a = offsetAngle + (i / count) * Math.PI * 2;
+    let diff = a - gapDir;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    if (Math.abs(diff) > gapAngle / 2) {
+      spawnBullet(cx, cy, Math.cos(a) * speed, Math.sin(a) * speed, color, 4);
+    }
+  }
+}
+
+function patternCross(cx, cy, speed, color) {
+  // 4-way cross with gaps between arms
+  for (let arm = 0; arm < 4; arm++) {
+    const baseA = arm * Math.PI / 2;
+    for (let j = -1; j <= 1; j++) {
+      const a = baseA + j * 0.2;
+      spawnBullet(cx, cy, Math.cos(a) * speed, Math.sin(a) * speed, color, 4);
+    }
+  }
+}
+
+let spiralAngle = 0;
+let patternPhase = 0;
+let spawnPoints = [];
+
+function getSpawnPoint() {
+  const side = Math.floor(Math.random() * 4);
+  if (side === 0) return { x: Math.random() * W, y: -10 };
+  if (side === 1) return { x: W + 10, y: Math.random() * H };
+  if (side === 2) return { x: Math.random() * W, y: H + 10 };
+  return { x: -10, y: Math.random() * H };
+}
+
+function spawnBulletWave(t) {
+  const intensity = Math.min(t / 60, 1.0); // 0 to 1 over first 60s
+  const baseSpeed = 1.5 + intensity * 2.0;
+  const sp = getSpawnPoint();
+
+  // Limit max bullet count to prevent unsolvable screens
+  if (bullets.length > 180) return;
+
+  const pattern = Math.floor(Math.random() * 5);
+  if (pattern === 0) {
+    spiralAngle += 0.35;
+    patternSpiral(sp.x, sp.y, spiralAngle, 8 + Math.floor(intensity * 6), baseSpeed, '#ff00ff');
+  } else if (pattern === 1) {
+    patternAimed(sp.x, sp.y, player.x, player.y, 0.22, 3 + Math.floor(intensity * 2), baseSpeed * 1.1, '#00ffff');
+  } else if (pattern === 2) {
+    patternScatter(sp.x, sp.y, 6 + Math.floor(intensity * 8), baseSpeed * 0.9, '#ff6600');
+  } else if (pattern === 3) {
+    patternRing(W / 2, H / 2, 16 + Math.floor(intensity * 8), baseSpeed, '#ff00ff', spiralAngle * 0.5);
+    spiralAngle += 0.5;
+  } else {
+    patternCross(sp.x, sp.y, baseSpeed * 1.2, '#00ff88');
+  }
+}
+
+// ============================================================
+// PARTICLES
+// ============================================================
+function spawnExplosion(x, y, count, colors) {
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 1 + Math.random() * 7;
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    particles.push({
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 0.6 + Math.random() * 0.8,
+      maxLife: 0.6 + Math.random() * 0.8,
+      radius: 2 + Math.random() * 4,
+      color,
+    });
+  }
+}
+
+function spawnShockwave(x, y, color) {
+  shockwaves.push({ x, y, radius: 0, maxRadius: 120, life: 0.5, maxLife: 0.5, color });
+}
+
+// ============================================================
+// ITEMS (HP recovery)
+// ============================================================
+function spawnItem() {
+  items.push({
+    x: 60 + Math.random() * (W - 120),
+    y: -20,
+    vy: 0.8 + Math.random() * 0.4,
+    pulse: 0,
+  });
+}
+
+// ============================================================
+// PLAYER DEATH
+// ============================================================
+function triggerDeath() {
+  spawnExplosion(player.x, player.y, 120, ['#ff00ff', '#00ffff', '#ff6600', '#ffffff', '#00ff88']);
+  spawnShockwave(player.x, player.y, '#ff00ff');
+  playGameOverSound();
+  stopBGM();
+  glitchTimer = 0.3;
+}
+
+// ============================================================
+// GAME RESET
+// ============================================================
+function resetGame() {
+  player.x = W / 2; player.y = H / 2;
+  player.hp = 3; player.invincible = 0;
+  chrono.gauge = 0; chrono.active = false; chrono.timer = 0;
+  bullets = []; items = []; particles = []; shockwaves = [];
+  survivalTime = 0; spawnTimer = 0; itemTimer = 0;
+  glitchTimer = 0;
+  spiralAngle = 0; patternPhase = 0;
+  gameOverTimer = 0; gameOverExplosionDone = false;
+  bgmPlaying = false;
+  startBGM();
+  state = STATES.PLAYING;
+}
+
+// ============================================================
+// INPUT
+// ============================================================
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space' && state === STATES.PLAYING) {
+    e.preventDefault();
+    if (chrono.gauge >= chrono.maxGauge && !chrono.active) {
+      chrono.active = true;
+      chrono.timer = chrono.duration;
+      chrono.gauge = 0;
+      playSlowSound();
+    }
+  }
+  if (e.code === 'KeyR') {
+    if (state === STATES.GAMEOVER || state === STATES.TITLE) {
+      initAudio();
+      resetGame();
+    }
+  }
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) {
+    useMouseControl = false;
+  }
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.clientX - rect.left) * (W / rect.width);
+  mouseY = (e.clientY - rect.top) * (H / rect.height);
+  useMouseControl = true;
+});
+
+canvas.addEventListener('click', () => {
+  initAudio();
+  if (state === STATES.TITLE) resetGame();
+});
+
+// ============================================================
+// UPDATE
+// ============================================================
+let lastTime = 0;
+
+function update(dt) {
+  if (state === STATES.TITLE) return;
+
+  if (state === STATES.GAMEOVER) {
+    // Animate particles and shockwaves even on game over
+    updateParticles(dt);
+    updateShockwaves(dt);
+    gameOverTimer += dt;
+    return;
+  }
+
+  // === Survival time ===
+  survivalTime += dt;
+  gridOffset = (gridOffset + dt * 40) % 80;
+
+  // === Chrono Drive ===
+  if (chrono.active) {
+    chrono.timer -= dt;
+    if (chrono.timer <= 0) { chrono.active = false; chrono.timer = 0; }
+  } else {
+    chrono.gauge = Math.min(chrono.maxGauge, chrono.gauge + chrono.chargeRate * dt);
+  }
+
+  // === Player movement ===
+  const isPrecise = !!(keys['ShiftLeft'] || keys['ShiftRight']);
+  const spd = isPrecise ? player.preciseSpeed : player.speed;
+
+  if (useMouseControl) {
+    // Mouse: snap to cursor at current speed cap (feels immediate)
+    const dx = mouseX - player.x;
+    const dy = mouseY - player.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 0.5) {
+      const move = Math.min(dist, spd);
+      player.x += (dx / dist) * move;
+      player.y += (dy / dist) * move;
+    }
+  } else {
+    // Keyboard: purely digital — direct coordinate change, zero inertia
+    let mx = 0, my = 0;
+    if (keys['ArrowLeft']  || keys['KeyA']) mx -= 1;
+    if (keys['ArrowRight'] || keys['KeyD']) mx += 1;
+    if (keys['ArrowUp']    || keys['KeyW']) my -= 1;
+    if (keys['ArrowDown']  || keys['KeyS']) my += 1;
+
+    // Normalize diagonal so diag speed equals cardinal speed
+    if (mx !== 0 && my !== 0) { mx *= 0.707; my *= 0.707; }
+
+    player.x += mx * spd;
+    player.y += my * spd;
+  }
+  player.x = Math.max(12, Math.min(W - 12, player.x));
+  player.y = Math.max(12, Math.min(H - 12, player.y));
+
+  // === Invincibility timer ===
+  if (player.invincible > 0) player.invincible -= dt;
+
+  // === Bullet spawning ===
+  const spawnInterval = Math.max(0.35, 1.4 - survivalTime / 80);
+  spawnTimer += dt;
+  if (spawnTimer >= spawnInterval) {
+    spawnTimer = 0;
+    spawnBulletWave(survivalTime);
+  }
+
+  // === Item spawning ===
+  itemTimer += dt;
+  itemInterval = 7 + Math.random() * 3;
+  if (itemTimer >= itemInterval) {
+    itemTimer = 0;
+    spawnItem();
+  }
+
+  // === Bullets update ===
+  const slow = chrono.active ? chrono.slowFactor : 1;
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    // trail
+    b.trail.push({ x: b.x, y: b.y });
+    if (b.trail.length > 5) b.trail.shift();
+
+    b.x += b.vx * slow;
+    b.y += b.vy * slow;
+
+    // Out of bounds
+    if (b.x < -30 || b.x > W + 30 || b.y < -30 || b.y > H + 30) {
+      bullets.splice(i, 1);
+      continue;
+    }
+
+    // Collision with player core
+    if (player.invincible <= 0) {
+      const dx = b.x - player.x;
+      const dy = b.y - player.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < player.coreRadius + b.radius - 2) {
+        bullets.splice(i, 1);
+        player.hp -= 1;
+        player.invincible = 1.5;
+        glitchTimer = GLITCH_DURATION;
+        playHitSound();
+        spawnExplosion(player.x, player.y, 20, ['#ff0000', '#ff6600', '#ffffff']);
+        if (player.hp <= 0) {
+          triggerDeath();
+          currentRankings = saveRanking(survivalTime);
+          state = STATES.GAMEOVER;
+        }
+        continue;
+      }
+    }
+  }
+
+  // === Items update ===
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.y += it.vy;
+    it.pulse += dt * 3;
+    if (it.y > H + 20) { items.splice(i, 1); continue; }
+    const dx = it.x - player.x;
+    const dy = it.y - player.y;
+    if (Math.sqrt(dx * dx + dy * dy) < 18) {
+      items.splice(i, 1);
+      player.hp = Math.min(player.maxHp, player.hp + 1);
+      spawnExplosion(it.x, it.y, 20, ['#00ff88', '#88ff00', '#ffffff']);
+    }
+  }
+
+  // === Glitch timer ===
+  if (glitchTimer > 0) glitchTimer -= dt;
+
+  updateParticles(dt);
+  updateShockwaves(dt);
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.05;
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function updateShockwaves(dt) {
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const s = shockwaves[i];
+    s.radius += (s.maxRadius / s.maxLife) * dt;
+    s.life -= dt;
+    if (s.life <= 0) shockwaves.splice(i, 1);
+  }
+}
+
+// ============================================================
+// DRAW HELPERS
+// ============================================================
+function neon(ctx, color, blur) {
+  ctx.shadowColor = color;
+  ctx.shadowBlur = blur || 15;
+}
+function clearNeon(ctx) {
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+}
+
+function drawGrid() {
+  ctx.save();
+  ctx.strokeStyle = '#00ffff22';
+  ctx.lineWidth = 0.8;
+  ctx.shadowColor = '#00ffff';
+  ctx.shadowBlur = 3;
+  const size = 80;
+  // Vertical lines scrolling downward
+  for (let x = 0; x < W; x += size) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  }
+  // Horizontal lines scrolling
+  for (let y = (gridOffset % size) - size; y < H; y += size) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+  // Perspective lines from bottom center
+  const vanishX = W / 2, vanishY = H * 0.72;
+  ctx.strokeStyle = '#00ffff15';
+  ctx.shadowBlur = 2;
+  for (let i = -8; i <= 8; i++) {
+    const tx = W / 2 + i * 60;
+    ctx.beginPath(); ctx.moveTo(vanishX, vanishY); ctx.lineTo(tx, H); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawPlayer() {
+  if (state === STATES.GAMEOVER) return;
+  const t = Date.now() / 1000;
+
+  // Flicker when invincible
+  if (player.invincible > 0 && Math.floor(player.invincible * 10) % 2 === 0) return;
+
+  const isPrecise = !!(keys['ShiftLeft'] || keys['ShiftRight']);
+
+  ctx.save();
+  ctx.translate(player.x, player.y);
+
+  // ----------------------------------------------------------------
+  // 1. JET EXHAUST – drawn first (behind the ship body)
+  // ----------------------------------------------------------------
+  // Two burner nozzles: left (-7, 10) and right (+7, 10) in local space
+  const burnerOffsets = [{ x: -7, y: 10 }, { x: 7, y: 10 }];
+  burnerOffsets.forEach(noz => {
+    // Flame length varies with noise-like wobble
+    const wobble1 = Math.sin(t * 23 + noz.x)  * 0.4 + 0.6; // 0.2–1.0
+    const wobble2 = Math.sin(t * 17 + noz.x * 2) * 0.3 + 0.7;
+    const flameLen = (isPrecise ? 14 : 22) * wobble1;
+    const flameW   = 5 * wobble2;
+
+    // Outer flame (orange → transparent)
+    const grad1 = ctx.createLinearGradient(noz.x, noz.y, noz.x, noz.y + flameLen);
+    grad1.addColorStop(0,   'rgba(255,140,0,0.95)');
+    grad1.addColorStop(0.4, 'rgba(255,60,120,0.7)');
+    grad1.addColorStop(1,   'rgba(255,0,80,0)');
+    ctx.save();
+    ctx.shadowColor = '#ff6600';
+    ctx.shadowBlur  = 18;
+    ctx.beginPath();
+    ctx.moveTo(noz.x - flameW * 0.5, noz.y);
+    ctx.bezierCurveTo(
+      noz.x - flameW * 0.8, noz.y + flameLen * 0.5,
+      noz.x + flameW * 0.8, noz.y + flameLen * 0.5,
+      noz.x, noz.y + flameLen
+    );
+    ctx.closePath();
+    ctx.fillStyle = grad1;
+    ctx.fill();
+
+    // Inner core flame (brighter, narrower)
+    const grad2 = ctx.createLinearGradient(noz.x, noz.y, noz.x, noz.y + flameLen * 0.6);
+    grad2.addColorStop(0,   'rgba(255,255,200,1)');
+    grad2.addColorStop(0.5, 'rgba(255,180,0,0.8)');
+    grad2.addColorStop(1,   'rgba(255,80,0,0)');
+    ctx.shadowColor = '#ffffff';
+    ctx.shadowBlur  = 10;
+    ctx.beginPath();
+    ctx.moveTo(noz.x - flameW * 0.2, noz.y);
+    ctx.bezierCurveTo(
+      noz.x - flameW * 0.3, noz.y + flameLen * 0.3,
+      noz.x + flameW * 0.3, noz.y + flameLen * 0.3,
+      noz.x, noz.y + flameLen * 0.6
+    );
+    ctx.closePath();
+    ctx.fillStyle = grad2;
+    ctx.fill();
+    ctx.restore();
+  });
+
+  // ----------------------------------------------------------------
+  // 2. SHIP BODY – near-future fighter silhouette
+  //
+  //  Coordinate system: nose points UP (negative Y), tail points DOWN.
+  //  All coords in local pixel space (origin = ship center / core).
+  //
+  //   Fuselage spine:  (0,-18) → (0,12)
+  //   Cockpit canopy:  small rounded diamond around (0,-8)
+  //   Main wings:      sweep back from (±4,-2) → (±22, 8) tip
+  //   Wing trailing:   (±22,8) → (±8,12)
+  //   Tail fins:       (±4,10) → (±10,14) → (±4,14)
+  // ----------------------------------------------------------------
+
+  const shipColor = '#00ffff';
+  const accentColor = '#88eeff';
+  const glowBlur = isPrecise ? 28 : 20;
+
+  // --- fuselage (main body outline) ---
+  ctx.save();
+  neon(ctx, shipColor, glowBlur);
+  ctx.strokeStyle = shipColor;
+  ctx.lineWidth = 1.8;
+  ctx.lineJoin = 'round';
+
+  // Nose → right leading edge → right wing tip → right trailing → tail right → tail center
+  ctx.beginPath();
+  ctx.moveTo(0, -18);            // nose tip
+  ctx.lineTo(3, -10);            // right shoulder
+  ctx.lineTo(22, 8);             // right wing tip
+  ctx.lineTo(8, 12);             // right wing trailing edge
+  ctx.lineTo(4, 10);             // right engine nacelle outer
+  ctx.lineTo(7, 14);             // right tail fin tip
+  ctx.lineTo(4, 14);             // right tail fin inner
+  ctx.lineTo(0, 12);             // tail center
+  ctx.lineTo(-4, 14);            // left tail fin inner
+  ctx.lineTo(-7, 14);            // left tail fin tip
+  ctx.lineTo(-4, 10);            // left engine nacelle outer
+  ctx.lineTo(-8, 12);            // left wing trailing edge
+  ctx.lineTo(-22, 8);            // left wing tip
+  ctx.lineTo(-3, -10);           // left shoulder
+  ctx.closePath();               // back to nose
+  ctx.stroke();
+
+  // Slight translucent fill
+  ctx.fillStyle = 'rgba(0,255,255,0.06)';
+  ctx.fill();
+  ctx.restore();
+
+  // --- centerline spine accent ---
+  ctx.save();
+  ctx.strokeStyle = accentColor;
+  ctx.lineWidth = 1.2;
+  ctx.shadowColor = '#ffffff';
+  ctx.shadowBlur = 8;
+  ctx.beginPath();
+  ctx.moveTo(0, -14);
+  ctx.lineTo(0, 11);
+  ctx.stroke();
+
+  // --- wing surface crease lines (left and right) ---
+  ctx.strokeStyle = accentColor + 'aa';
+  ctx.lineWidth = 0.9;
+  ctx.shadowBlur = 4;
+  // right crease
+  ctx.beginPath();
+  ctx.moveTo(3, -4);
+  ctx.lineTo(16, 7);
+  ctx.stroke();
+  // left crease
+  ctx.beginPath();
+  ctx.moveTo(-3, -4);
+  ctx.lineTo(-16, 7);
+  ctx.stroke();
+  ctx.restore();
+
+  // --- cockpit canopy ---
+  ctx.save();
+  neon(ctx, '#aaddff', 12);
+  ctx.strokeStyle = '#aaddff';
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(0, -16);
+  ctx.lineTo(2.5, -9);
+  ctx.lineTo(0, -6);
+  ctx.lineTo(-2.5, -9);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(160,230,255,0.18)';
+  ctx.fill();
+  ctx.restore();
+
+  // --- engine nacelles (two small rectangles) ---
+  ctx.save();
+  ctx.strokeStyle = '#00ffaa';
+  ctx.lineWidth = 1.2;
+  neon(ctx, '#00ffaa', 10);
+  [[-7, 8], [7, 8]].forEach(([nx, ny]) => {
+    ctx.strokeRect(nx - 2.5, ny - 1.5, 5, 5);
+  });
+  ctx.restore();
+
+  // ----------------------------------------------------------------
+  // 3. HIT-ZONE CORE – always rendered on top
+  // ----------------------------------------------------------------
+  const coreR = player.coreRadius;
+  const coreGlowColor = isPrecise ? '#ff66ff' : '#ff22aa';
+  const coreGlowBlur  = isPrecise ? 28 : 16;
+  const ringAlpha     = isPrecise ? 0.9 : 0.55;
+
+  ctx.save();
+  // Outer soft halo
+  const haloGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, coreR * (isPrecise ? 4.5 : 3));
+  haloGrad.addColorStop(0,   `rgba(255,50,180,${isPrecise ? 0.55 : 0.30})`);
+  haloGrad.addColorStop(0.5, `rgba(255,0,120,${isPrecise ? 0.25 : 0.12})`);
+  haloGrad.addColorStop(1,   'rgba(255,0,100,0)');
+  ctx.fillStyle = haloGrad;
+  ctx.beginPath();
+  ctx.arc(0, 0, coreR * (isPrecise ? 4.5 : 3), 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outer ring (more visible in precise mode)
+  neon(ctx, coreGlowColor, coreGlowBlur);
+  ctx.strokeStyle = `rgba(255,100,220,${ringAlpha})`;
+  ctx.lineWidth = isPrecise ? 1.5 : 1;
+  ctx.beginPath();
+  ctx.arc(0, 0, coreR + (isPrecise ? 4 : 2.5), 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Solid inner dot
+  ctx.shadowColor = '#ff00cc';
+  ctx.shadowBlur  = coreGlowBlur;
+  ctx.beginPath();
+  ctx.arc(0, 0, coreR, 0, Math.PI * 2);
+  ctx.fillStyle = isPrecise ? '#ff88ff' : '#ff22bb';
+  ctx.fill();
+
+  // Bright white center pinpoint
+  ctx.shadowBlur = 6;
+  ctx.shadowColor = '#ffffff';
+  ctx.beginPath();
+  ctx.arc(0, 0, coreR * 0.45, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.restore(); // pop translate
+}
+
+function drawBullets() {
+  for (const b of bullets) {
+    ctx.save();
+    // Trail
+    for (let t = 0; t < b.trail.length; t++) {
+      const alpha = (t + 1) / b.trail.length * 0.4;
+      ctx.beginPath();
+      ctx.arc(b.trail[t].x, b.trail[t].y, b.radius * 0.6, 0, Math.PI * 2);
+      ctx.fillStyle = b.color + Math.floor(alpha * 255).toString(16).padStart(2, '0');
+      ctx.fill();
+    }
+    // Bullet
+    neon(ctx, b.color, 12);
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+    ctx.fillStyle = b.color;
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawItems() {
+  for (const it of items) {
+    ctx.save();
+    const pulse = 0.7 + 0.3 * Math.sin(it.pulse);
+    neon(ctx, '#00ff88', 18 * pulse);
+    ctx.strokeStyle = '#00ff88';
+    ctx.lineWidth = 2;
+    ctx.fillStyle = '#00ff8822';
+    ctx.beginPath();
+    ctx.arc(it.x, it.y, 14, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = `rgba(0, 255, 136, ${pulse})`;
+    ctx.font = 'bold 12px Courier New';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 15;
+    ctx.fillText('[H]', it.x, it.y);
+    ctx.restore();
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    ctx.save();
+    neon(ctx, p.color, 10);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.radius * alpha, 0, Math.PI * 2);
+    ctx.fillStyle = p.color + Math.floor(alpha * 255).toString(16).padStart(2, '0');
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawShockwaves() {
+  for (const s of shockwaves) {
+    const alpha = s.life / s.maxLife;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = s.color + Math.floor(alpha * 180).toString(16).padStart(2, '0');
+    ctx.lineWidth = 3 * alpha;
+    ctx.shadowColor = s.color;
+    ctx.shadowBlur = 20;
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// ============================================================
+// HUD
+// ============================================================
+function drawHUD() {
+  ctx.save();
+  const hudY = 12;
+  // HP Bar background
+  const barW = 180, barH = 18;
+  const barX = 16, barY = hudY;
+  ctx.strokeStyle = '#00ffff44';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  // HP Segments
+  for (let i = 0; i < player.maxHp; i++) {
+    const segW = barW / player.maxHp - 3;
+    const segX = barX + i * (barW / player.maxHp) + 1;
+    if (i < player.hp) {
+      const hpColors = ['#00ff88', '#ffff00', '#ff4444'];
+      const col = player.hp >= 2 ? '#00ff88' : player.hp === 1 ? '#ff6600' : '#ff0000';
+      neon(ctx, col, 12);
+      ctx.fillStyle = col;
+      ctx.fillRect(segX, barY + 2, segW, barH - 4);
+    } else {
+      ctx.fillStyle = '#111';
+      ctx.fillRect(segX + 1, barY + 3, segW - 2, barH - 6);
+    }
+  }
+  clearNeon(ctx);
+  neon(ctx, '#00ffff', 8);
+  ctx.fillStyle = '#00ffff';
+  ctx.font = '12px Courier New';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('HP', barX + 4, barY + barH / 2);
+
+  // Chrono Gauge
+  const cgX = barX, cgY = barY + barH + 6;
+  const cgW = 180, cgH = 12;
+  ctx.strokeStyle = '#ff00ff44';
+  ctx.shadowColor = '#ff00ff';
+  ctx.shadowBlur = 5;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(cgX, cgY, cgW, cgH);
+
+  const fillW = (chrono.gauge / chrono.maxGauge) * (cgW - 4);
+  const chronoColor = chrono.active ? '#ffffff' : chrono.gauge >= chrono.maxGauge ? '#ff00ff' : '#aa00aa';
+  neon(ctx, chronoColor, 10);
+  ctx.fillStyle = chronoColor;
+  ctx.fillRect(cgX + 2, cgY + 2, fillW, cgH - 4);
+
+  clearNeon(ctx);
+  const chronoLabel = chrono.active
+    ? `CHRONO: ${chrono.timer.toFixed(1)}s`
+    : chrono.gauge >= chrono.maxGauge
+    ? 'CHRONO: READY [SPC]'
+    : `CHRONO: ${Math.floor(chrono.gauge)}%`;
+  neon(ctx, '#ff00ff', 8);
+  ctx.fillStyle = '#ff00ff';
+  ctx.font = '10px Courier New';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(chronoLabel, cgX + 4, cgY + cgH / 2);
+
+  // Slow indicator overlay
+  if (chrono.active) {
+    ctx.fillStyle = '#0044ff08';
+    ctx.fillRect(0, 0, W, H);
+    neon(ctx, '#4488ff', 20);
+    ctx.strokeStyle = '#4488ffaa';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(2, 2, W - 4, H - 4);
+    ctx.font = 'bold 14px Courier New';
+    ctx.fillStyle = '#88aaff';
+    ctx.textAlign = 'right';
+    ctx.fillText('BULLET STORM ACTIVE', W - 16, 20);
+  }
+
+  // Precise mode indicator
+  const isPreciseHUD = !!(keys['ShiftLeft'] || keys['ShiftRight']);
+  if (isPreciseHUD) {
+    const pmX = barX, pmY = cgY + cgH + 6;
+    const pmW = 180, pmH = 12;
+    // Pulsing border
+    const pmPulse = 0.7 + 0.3 * Math.sin(Date.now() / 120);
+    neon(ctx, '#ff66ff', 16 * pmPulse);
+    ctx.strokeStyle = `rgba(255,102,255,${pmPulse})`;
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(pmX, pmY, pmW, pmH);
+    ctx.fillStyle = `rgba(255,50,200,${0.18 * pmPulse})`;
+    ctx.fillRect(pmX + 1, pmY + 1, pmW - 2, pmH - 2);
+    ctx.fillStyle = '#ff88ff';
+    ctx.font = 'bold 9px Courier New';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = '#ff00ff';
+    ctx.shadowBlur = 10;
+    ctx.fillText('>> PRECISE MODE  [SHIFT]', pmX + 6, pmY + pmH / 2);
+  }
+
+  // Time / Score
+  ctx.textAlign = 'right';
+  neon(ctx, '#00ffff', 12);
+  ctx.fillStyle = '#00ffff';
+  ctx.font = 'bold 18px Courier New';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(formatTime(survivalTime), W - 16, hudY + 9);
+  ctx.font = '11px Courier New';
+  ctx.fillStyle = '#00ffff88';
+  ctx.fillText('SURVIVAL TIME', W - 16, hudY + 24);
+
+  ctx.restore();
+}
+
+function formatTime(s) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  const ms = Math.floor((s % 1) * 100);
+  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${String(ms).padStart(2, '0')}`;
+}
+
+// ============================================================
+// TITLE SCREEN
+// ============================================================
+function drawTitle() {
+  ctx.save();
+  drawGrid();
+
+  // Scanline effect
+  for (let y = 0; y < H; y += 4) {
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.fillRect(0, y, W, 2);
+  }
+
+  const t = Date.now() / 1000;
+  const pulse = 0.8 + 0.2 * Math.sin(t * 2);
+
+  // Title
+  neon(ctx, '#00ffff', 40 * pulse);
+  ctx.fillStyle = '#00ffff';
+  ctx.font = `bold 64px Courier New`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('BULLET', W / 2, H / 2 - 80);
+  neon(ctx, '#ff00ff', 40 * pulse);
+  ctx.fillStyle = '#ff00ff';
+  ctx.fillText('STORM', W / 2, H / 2 - 10);
+
+  ctx.font = '14px Courier New';
+  neon(ctx, '#00ff88', 10);
+  ctx.fillStyle = '#00ff88';
+  ctx.fillText('>> NEAR-FUTURE BULLET HELL <<', W / 2, H / 2 + 50);
+
+  ctx.font = '13px Courier New';
+  ctx.fillStyle = '#aaaaaa';
+  ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0;
+  ctx.fillText('MOUSE / ARROW KEYS: Move   |   SPACE: Bullet Storm Drive', W / 2, H / 2 + 88);
+  neon(ctx, '#ff88ff', 8);
+  ctx.fillStyle = '#ff88ff';
+  ctx.font = '12px Courier New';
+  ctx.fillText('SHIFT: Precise Mode (half speed · core highlight)', W / 2, H / 2 + 110);
+
+  neon(ctx, '#ffff00', 15 * pulse);
+  ctx.fillStyle = '#ffff00';
+  ctx.font = `bold ${14 + 2 * Math.sin(t * 3)}px Courier New`;
+  ctx.fillText('[ CLICK or press R to START ]', W / 2, H / 2 + 135);
+
+  ctx.restore();
+}
+
+// ============================================================
+// GAME OVER SCREEN
+// ============================================================
+function drawGameOver() {
+  ctx.save();
+  drawGrid();
+  drawParticles();
+  drawShockwaves();
+
+  // Scanlines
+  for (let y = 0; y < H; y += 4) {
+    ctx.fillStyle = 'rgba(0,0,0,0.1)';
+    ctx.fillRect(0, y, W, 2);
+  }
+
+  const t = Date.now() / 1000;
+  const delay = 1.5;
+  if (gameOverTimer < delay) { ctx.restore(); return; }
+
+  const fade = Math.min(1, (gameOverTimer - delay) / 0.8);
+  ctx.globalAlpha = fade;
+
+  // Overlay
+  ctx.fillStyle = 'rgba(0,0,0,0.75)';
+  ctx.fillRect(W / 2 - 280, H / 2 - 220, 560, 440);
+  neon(ctx, '#ff00ff', 20);
+  ctx.strokeStyle = '#ff00ff';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(W / 2 - 280, H / 2 - 220, 560, 440);
+
+  ctx.textAlign = 'center';
+
+  // GAME OVER text
+  neon(ctx, '#ff0000', 30);
+  ctx.fillStyle = '#ff4444';
+  ctx.font = 'bold 52px Courier New';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('GAME OVER', W / 2, H / 2 - 155);
+
+  // Score
+  neon(ctx, '#00ffff', 20);
+  ctx.fillStyle = '#00ffff';
+  ctx.font = '18px Courier New';
+  ctx.fillText('SURVIVAL TIME', W / 2, H / 2 - 90);
+  ctx.font = 'bold 36px Courier New';
+  ctx.fillText(formatTime(survivalTime), W / 2, H / 2 - 55);
+
+  // Rankings
+  neon(ctx, '#ff00ff', 15);
+  ctx.fillStyle = '#ff00ff';
+  ctx.font = 'bold 16px Courier New';
+  ctx.fillText('-- TOP 5 RANKINGS --', W / 2, H / 2 - 5);
+
+  const rankColors = ['#ffd700', '#c0c0c0', '#cd7f32', '#00ffff', '#ff00ff'];
+  const ranks = currentRankings;
+  for (let i = 0; i < 5; i++) {
+    const rank = ranks[i];
+    const col = rankColors[i] || '#888888';
+    neon(ctx, col, 10);
+    ctx.fillStyle = rank !== undefined ? col : '#444444';
+    ctx.font = `${i === 0 ? 'bold ' : ''}15px Courier New`;
+    const label = rank !== undefined ? `#${i + 1}  ${formatTime(rank)}` : `#${i + 1}  --:--:--`;
+    ctx.fillText(label, W / 2, H / 2 + 35 + i * 30);
+  }
+
+  // Retry button
+  const pulse2 = 0.8 + 0.2 * Math.sin(t * 3);
+  neon(ctx, '#00ff88', 20 * pulse2);
+  ctx.fillStyle = '#00ff88';
+  ctx.font = `bold 18px Courier New`;
+  ctx.fillText('[ PRESS R TO RETRY ]', W / 2, H / 2 + 195);
+
+  ctx.restore();
+}
+
+// ============================================================
+// MAIN RENDER
+// ============================================================
+function draw() {
+  if (state === STATES.TITLE) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    drawTitle();
+    return;
+  }
+
+  if (state === STATES.GAMEOVER) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    drawGameOver();
+    return;
+  }
+
+  // === Glitch pre-pass ===
+  const glitchActive = glitchTimer > 0;
+  const glitchX = glitchActive ? (Math.random() - 0.5) * 8 : 0;
+
+  ctx.save();
+  if (glitchActive) ctx.translate(glitchX, 0);
+
+  // Background
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, W, H);
+
+  // Chrono slow vignette
+  if (chrono.active) {
+    const grad = ctx.createRadialGradient(W / 2, H / 2, 100, W / 2, H / 2, W);
+    grad.addColorStop(0, 'transparent');
+    grad.addColorStop(1, 'rgba(0, 30, 120, 0.3)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  drawGrid();
+
+  // Scanlines
+  for (let y = 0; y < H; y += 4) {
+    ctx.fillStyle = 'rgba(0,0,0,0.06)';
+    ctx.fillRect(0, y, W, 2);
+  }
+
+  drawShockwaves();
+  drawBullets();
+  drawItems();
+  drawPlayer();
+  drawParticles();
+
+  ctx.restore();
+
+  // Second glitch layer offset (horizontal slice artifact)
+  if (glitchActive) {
+    const sliceH = 20 + Math.random() * 30;
+    const sliceY = Math.random() * (H - sliceH);
+    const imageData = ctx.getImageData(0, sliceY, W, sliceH);
+    ctx.putImageData(imageData, glitchX * 2, sliceY);
+  }
+
+  drawHUD();
+}
+
+// ============================================================
+// GAME LOOP
+// ============================================================
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+
+  update(dt);
+  draw();
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ============================================================
+// BOOT
+// ============================================================
+// Retry button click on canvas during GAMEOVER
+canvas.addEventListener('click', e => {
+  if (state === STATES.GAMEOVER) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = (e.clientX - rect.left) * (W / rect.width);
+    const cy = (e.clientY - rect.top) * (H / rect.height);
+    // Retry area roughly
+    if (cy > H / 2 + 175 && cy < H / 2 + 215 && cx > W / 2 - 180 && cx < W / 2 + 180) {
+      initAudio();
+      resetGame();
+    }
+  }
+});
+
+// Start the loop
+requestAnimationFrame(ts => {
+  lastTime = ts;
+  requestAnimationFrame(gameLoop);
+});
+
+</script>
+</body>
+</html>
